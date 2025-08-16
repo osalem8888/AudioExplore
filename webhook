@@ -1,0 +1,67 @@
+api/kobo-webhook.js
+// api/kobo-webhook.js
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Use POST' });
+  }
+
+  const KOBO_BASE_URL   = process.env.KOBO_BASE_URL || 'https://kf.kobotoolbox.org';
+  const KOBO_TOKEN      = process.env.KOBO_TOKEN;
+  const OPENAI_API_KEY  = process.env.OPENAI_API_KEY;
+  const ASSISTANT_ID    = process.env.ASSISTANT_ID;
+
+  // 1) Get Kobo submission
+  const submission = req.body || {};
+  const audio = (submission._attachments || []).find(a => (a.mimetype||'').startsWith('audio/'));
+
+  if (!audio?.download_url) {
+    return res.status(400).json({ error: 'No audio attachment found' });
+  }
+
+  // 2) Download audio from Kobo
+  const audioResp = await fetch(audio.download_url, {
+    headers: { Authorization: `Token ${KOBO_TOKEN}` }
+  });
+  const abuf = await audioResp.arrayBuffer();
+  const blob = new Blob([abuf], { type: audio.mimetype || 'audio/mpeg' });
+
+  // 3) Transcribe with OpenAI
+  const fd = new FormData();
+  fd.set('file', blob, audio.filename || 'audio.mp3');
+  fd.set('model', 'gpt-4o-mini-transcribe');
+  fd.set('translate', 'true'); // force English if needed
+
+  const trResp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: fd
+  });
+  const trJson = await trResp.json();
+  const transcript = trJson.text || '';
+
+  // 4) Send transcript to your Assistant
+  const thread = await fetch('https://api.openai.com/v1/threads', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+      'OpenAI-Beta': 'assistants=v2'
+    },
+    body: JSON.stringify({
+      messages: [{ role: 'user', content: transcript }]
+    })
+  }).then(r => r.json());
+
+  const run = await fetch(`https://api.openai.com/v1/threads/${thread.id}/runs`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+      'OpenAI-Beta': 'assistants=v2'
+    },
+    body: JSON.stringify({ assistant_id: ASSISTANT_ID })
+  }).then(r => r.json());
+
+  // Return transcript + run info (basic for now)
+  return res.status(200).json({ transcript, run });
+}
